@@ -968,6 +968,21 @@ main{
   }
 }
 
+
+.firebase-note{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:11px;
+  font-weight:800;
+  color:#16845f;
+}
+.firebase-note::before{
+  content:"";
+  width:7px;height:7px;border-radius:50%;
+  background:#20a875;
+  box-shadow:0 0 0 3px rgba(32,168,117,.10);
+}
 </style>
 </head>
 <body>
@@ -1159,12 +1174,36 @@ main{
 
 <div id="toast" class="toast"></div>
 
+
+<script src="https://www.gstatic.com/firebasejs/12.18.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.18.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore-compat.js"></script>
+
 <script>
 "use strict";
 
-const CREDENTIALS = {
-  admin:{nick:"ADM",password:"2023@@",role:"admin"},
-  acolhedor:{nick:"acolhedor",password:"1234",role:"acolhedor"}
+const firebaseConfig = {
+  apiKey: "AIzaSyCXgDngpEHNY4BnRE1c4mgjugELZBTI_h8",
+  authDomain: "sistema-acolhedores.firebaseapp.com",
+  projectId: "sistema-acolhedores",
+  storageBucket: "sistema-acolhedores.firebasestorage.app",
+  messagingSenderId: "825830594521",
+  appId: "1:825830594521:web:c68e249decf74ac196abc8"
+};
+
+firebase.initializeApp(firebaseConfig);
+
+const auth = firebase.auth();
+const db = firebase.firestore();
+
+const LOGIN_EMAILS = {
+  adm: "admin@sistema-acolhedores.com",
+  acolhedor: "acolhedor@sistema-acolhedores.com"
+};
+
+const ROLE_BY_EMAIL = {
+  "admin@sistema-acolhedores.com": "admin",
+  "acolhedor@sistema-acolhedores.com": "acolhedor"
 };
 
 const DEFAULT_MEMBERS = [
@@ -1220,25 +1259,193 @@ const KEY = {
   scale:"acolhedores_v3_scale"
 };
 
-let members = load(KEY.members, DEFAULT_MEMBERS);
-let actions = load(KEY.actions, []);
-let notices = load(KEY.notices, []);
-let scale = load(KEY.scale, {anchorDate:"2026-09-07",anchorGroup:0});
+const LOCAL_BACKUP = {
+  members: loadLocal(KEY.members, DEFAULT_MEMBERS),
+  actions: loadLocal(KEY.actions, []),
+  notices: loadLocal(KEY.notices, []),
+  scale: loadLocal(KEY.scale, {anchorDate:"2026-09-07",anchorGroup:0})
+};
+
+let members = [];
+let actions = [];
+let notices = [];
+let scale = {anchorDate:"2026-09-07",anchorGroup:0};
 let currentRole = null;
 let currentParticipantActionId = null;
 let currentJoinActionId = null;
+let realtimeUnsubscribers = [];
+let bootstrapRunning = false;
 
-function load(key,fallback){
+function loadLocal(key,fallback){
   try{
     const raw=localStorage.getItem(key);
     return raw?JSON.parse(raw):JSON.parse(JSON.stringify(fallback));
-  }catch(e){return JSON.parse(JSON.stringify(fallback))}
+  }catch(e){
+    return JSON.parse(JSON.stringify(fallback));
+  }
 }
-function persist(){
-  localStorage.setItem(KEY.members,JSON.stringify(members));
-  localStorage.setItem(KEY.actions,JSON.stringify(actions));
-  localStorage.setItem(KEY.notices,JSON.stringify(notices));
-  localStorage.setItem(KEY.scale,JSON.stringify(scale));
+
+function cacheLocal(){
+  try{
+    localStorage.setItem(KEY.members,JSON.stringify(members));
+    localStorage.setItem(KEY.actions,JSON.stringify(actions));
+    localStorage.setItem(KEY.notices,JSON.stringify(notices));
+    localStorage.setItem(KEY.scale,JSON.stringify(scale));
+  }catch(e){}
+}
+
+function cleanForFirestore(value){
+  return JSON.parse(JSON.stringify(value));
+}
+
+function firestoreError(error, fallback="Não foi possível sincronizar com o Firebase."){
+  console.error(error);
+  const code = error && error.code ? String(error.code) : "";
+  if(code.includes("permission-denied")){
+    alert("O Firebase bloqueou esta alteração pelas regras de segurança.");
+  }else if(code.includes("unavailable")){
+    alert("Sem conexão com o Firebase. Verifique sua internet e tente novamente.");
+  }else{
+    alert(fallback);
+  }
+}
+
+async function bootstrapDatabaseIfNeeded(){
+  if(currentRole !== "admin" || bootstrapRunning) return;
+  bootstrapRunning = true;
+
+  try{
+    const membersCheck = await db.collection("members").limit(1).get();
+
+    if(membersCheck.empty){
+      const seedMembers = Array.isArray(LOCAL_BACKUP.members) && LOCAL_BACKUP.members.length
+        ? LOCAL_BACKUP.members
+        : DEFAULT_MEMBERS;
+      const seedActions = Array.isArray(LOCAL_BACKUP.actions) ? LOCAL_BACKUP.actions : [];
+      const seedNotices = Array.isArray(LOCAL_BACKUP.notices) ? LOCAL_BACKUP.notices : [];
+      const seedScale = LOCAL_BACKUP.scale || {anchorDate:"2026-09-07",anchorGroup:0};
+
+      const batch = db.batch();
+
+      seedMembers.forEach(m=>{
+        batch.set(db.collection("members").doc(String(m.id)), cleanForFirestore(m));
+      });
+
+      seedActions.forEach(a=>{
+        batch.set(db.collection("actions").doc(String(a.id)), cleanForFirestore(a));
+      });
+
+      seedNotices.forEach(n=>{
+        batch.set(db.collection("notices").doc(String(n.id)), cleanForFirestore(n));
+      });
+
+      batch.set(db.collection("config").doc("scale"), cleanForFirestore(seedScale));
+
+      await batch.commit();
+      toast("Dados iniciais enviados para o Firebase.");
+    }else{
+      const configDoc = await db.collection("config").doc("scale").get();
+      if(!configDoc.exists){
+        await db.collection("config").doc("scale").set(
+          cleanForFirestore(LOCAL_BACKUP.scale || {anchorDate:"2026-09-07",anchorGroup:0})
+        );
+      }
+    }
+  }finally{
+    bootstrapRunning = false;
+  }
+}
+
+function stopRealtimeSync(){
+  realtimeUnsubscribers.forEach(fn=>{
+    try{ fn(); }catch(e){}
+  });
+  realtimeUnsubscribers = [];
+}
+
+function startRealtimeSync(){
+  stopRealtimeSync();
+
+  realtimeUnsubscribers.push(
+    db.collection("members").onSnapshot(snapshot=>{
+      members = snapshot.docs.map(doc=>doc.data());
+      cacheLocal();
+      renderAll();
+    }, error=>firestoreError(error,"Erro ao carregar os acolhedores."))
+  );
+
+  realtimeUnsubscribers.push(
+    db.collection("actions").onSnapshot(snapshot=>{
+      actions = snapshot.docs.map(doc=>doc.data());
+      normalizeActions();
+      cacheLocal();
+      renderAll();
+    }, error=>firestoreError(error,"Erro ao carregar as ações."))
+  );
+
+  realtimeUnsubscribers.push(
+    db.collection("notices").onSnapshot(snapshot=>{
+      notices = snapshot.docs.map(doc=>doc.data());
+      cacheLocal();
+      renderAll();
+    }, error=>firestoreError(error,"Erro ao carregar os avisos."))
+  );
+
+  realtimeUnsubscribers.push(
+    db.collection("config").doc("scale").onSnapshot(doc=>{
+      if(doc.exists){
+        scale = doc.data();
+        cacheLocal();
+        renderAll();
+      }
+    }, error=>firestoreError(error,"Erro ao carregar a escala."))
+  );
+}
+
+async function saveScaleRemote(){
+  await db.collection("config").doc("scale").set(cleanForFirestore(scale));
+}
+
+async function saveActionRemote(action){
+  await db.collection("actions").doc(String(action.id)).set(cleanForFirestore(action));
+}
+
+async function deleteActionRemote(id){
+  await db.collection("actions").doc(String(id)).delete();
+}
+
+async function saveMemberRemote(member){
+  await db.collection("members").doc(String(member.id)).set(cleanForFirestore(member));
+}
+
+async function deleteMemberRemote(id){
+  await db.collection("members").doc(String(id)).delete();
+}
+
+async function saveNoticeRemote(notice){
+  await db.collection("notices").doc(String(notice.id)).set(cleanForFirestore(notice));
+}
+
+async function deleteNoticeRemote(id){
+  await db.collection("notices").doc(String(id)).delete();
+}
+
+async function updateParticipantsTransaction(actionId, updater){
+  const ref = db.collection("actions").doc(String(actionId));
+
+  await db.runTransaction(async transaction=>{
+    const snapshot = await transaction.get(ref);
+    if(!snapshot.exists) throw new Error("Ação não encontrada.");
+
+    const data = snapshot.data();
+    const current = Array.isArray(data.participants)
+      ? data.participants.map(Number)
+      : [];
+
+    const next = updater(current, data);
+
+    transaction.update(ref,{participants:next});
+  });
 }
 function esc(value){
   return String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1288,24 +1495,86 @@ function normalizeActions(){
 normalizeActions();
 
 /* LOGIN */
-function login(){
-  const nick=document.getElementById("loginNick").value.trim();
-  const pass=document.getElementById("loginPassword").value;
-  const found=Object.values(CREDENTIALS).find(c=>c.nick===nick&&c.password===pass);
-  if(!found){document.getElementById("loginError").textContent="Nick ou senha incorretos.";return}
-  currentRole=found.role;
+function applyRoleInterface(){
   document.getElementById("loginScreen").classList.add("hidden");
   document.getElementById("app").classList.remove("hidden");
-  document.getElementById("roleText").textContent=currentRole==="admin"?"Administrador":"Acesso compartilhado dos acolhedores";
+  document.getElementById("roleText").textContent=currentRole==="admin"
+    ?"Administrador • Firebase"
+    :"Acesso compartilhado • Firebase";
   document.getElementById("roleBadge").textContent=currentRole==="admin"?"ADM":"ACOLHEDOR";
-  document.getElementById("welcomeText").textContent=currentRole==="admin"?"Gerencie a equipe, a escala e as ações.":"Veja a escala, os avisos e participe das ações.";
+  document.getElementById("welcomeText").textContent=currentRole==="admin"
+    ?"Gerencie a equipe, a escala e as ações. Alterações sincronizam para todos."
+    :"Veja a escala, os avisos e participe das ações em tempo real.";
   document.querySelectorAll(".admin-only").forEach(el=>el.classList.toggle("hidden",currentRole!=="admin"));
   document.querySelectorAll(".acolhedor-only").forEach(el=>el.classList.toggle("hidden",currentRole!=="acolhedor"));
-  renderAll();
 }
+
+async function login(){
+  const nick=document.getElementById("loginNick").value.trim().toLowerCase();
+  const pass=document.getElementById("loginPassword").value;
+  const email=LOGIN_EMAILS[nick];
+
+  document.getElementById("loginError").textContent="";
+
+  if(!email){
+    document.getElementById("loginError").textContent="Use ADM ou acolhedor.";
+    return;
+  }
+
+  const button=document.getElementById("loginBtn");
+  const oldText=button.textContent;
+  button.disabled=true;
+  button.textContent="Entrando...";
+
+  try{
+    await auth.signInWithEmailAndPassword(email,pass);
+  }catch(error){
+    console.error(error);
+    document.getElementById("loginError").textContent="Nick ou senha incorretos.";
+  }finally{
+    button.disabled=false;
+    button.textContent=oldText;
+  }
+}
+
 document.getElementById("loginBtn").addEventListener("click",login);
 document.getElementById("loginPassword").addEventListener("keydown",e=>{if(e.key==="Enter")login()});
-document.getElementById("logoutBtn").addEventListener("click",()=>location.reload());
+
+document.getElementById("logoutBtn").addEventListener("click",async ()=>{
+  await auth.signOut();
+});
+
+auth.onAuthStateChanged(async user=>{
+  if(!user){
+    stopRealtimeSync();
+    currentRole=null;
+    members=[];
+    actions=[];
+    notices=[];
+    scale={anchorDate:"2026-09-07",anchorGroup:0};
+    document.getElementById("app").classList.add("hidden");
+    document.getElementById("loginScreen").classList.remove("hidden");
+    return;
+  }
+
+  const email=(user.email||"").toLowerCase();
+  currentRole=ROLE_BY_EMAIL[email]||null;
+
+  if(!currentRole){
+    await auth.signOut();
+    document.getElementById("loginError").textContent="Esta conta não tem acesso ao sistema.";
+    return;
+  }
+
+  applyRoleInterface();
+
+  try{
+    await bootstrapDatabaseIfNeeded();
+    startRealtimeSync();
+  }catch(error){
+    firestoreError(error,"Não foi possível iniciar a sincronização com o Firebase.");
+  }
+});
 
 /* TABS */
 document.querySelectorAll(".tab").forEach(btn=>btn.addEventListener("click",()=>{
@@ -1341,11 +1610,16 @@ function renderScale(){
   }).join("");
   document.getElementById("scaleGroup").value=current;
 }
-document.getElementById("saveScaleBtn").addEventListener("click",()=>{
+document.getElementById("saveScaleBtn").addEventListener("click",async ()=>{
   if(currentRole!=="admin")return;
   const g=document.getElementById("scaleGroup").value;
-  scale={anchorDate:dateToIso(mondayOf(new Date())),anchorGroup:["G1","G2","G3","G4"].indexOf(g)};
-  persist();renderAll();toast("Escala semanal atualizada.");
+  const nextScale={anchorDate:dateToIso(mondayOf(new Date())),anchorGroup:["G1","G2","G3","G4"].indexOf(g)};
+  try{
+    await db.collection("config").doc("scale").set(cleanForFirestore(nextScale));
+    toast("Escala semanal atualizada para todos.");
+  }catch(error){
+    firestoreError(error,"Não foi possível salvar a escala.");
+  }
 });
 
 /* HOME */
@@ -1444,7 +1718,7 @@ function openEditAction(id){
   openModal("actionModal");
 }
 document.getElementById("newActionBtn").addEventListener("click",openNewAction);
-document.getElementById("saveActionBtn").addEventListener("click",()=>{
+document.getElementById("saveActionBtn").addEventListener("click",async ()=>{
   if(currentRole!=="admin")return;
   const id=document.getElementById("actionId").value;
   const name=document.getElementById("actionName").value.trim();
@@ -1454,27 +1728,71 @@ document.getElementById("saveActionBtn").addEventListener("click",()=>{
   const responsibleId=responsibleRaw?Number(responsibleRaw):null;
   const limit=Math.max(1,Number(document.getElementById("actionLimit").value)||1);
   const status=document.getElementById("actionStatus").value;
-  if(!name||!date){alert("Preencha o nome e a data.");return}
-  if(id){
-    const a=actions.find(x=>Number(x.id)===Number(id));if(!a)return;
-    if(limit<a.participants.length){alert(`O limite não pode ser menor que os ${a.participants.length} participantes atuais.`);return}
-    Object.assign(a,{name,date,description,responsibleId,limit,status});
-    toast("Ação atualizada.");
-  }else{
-    actions.push({id:Date.now(),name,date,description,responsibleId,limit,status,participants:[]});
-    toast("Ação criada.");
+
+  if(!name||!date){
+    alert("Preencha o nome e a data.");
+    return;
   }
-  persist();closeModals();renderAll();
+
+  let action;
+
+  if(id){
+    const current=actions.find(x=>Number(x.id)===Number(id));
+    if(!current)return;
+
+    if(limit<current.participants.length){
+      alert(`O limite não pode ser menor que os ${current.participants.length} participantes atuais.`);
+      return;
+    }
+
+    action={
+      ...current,
+      name,date,description,responsibleId,limit,status
+    };
+  }else{
+    action={
+      id:Date.now(),
+      name,date,description,responsibleId,limit,status,
+      participants:[]
+    };
+  }
+
+  try{
+    await saveActionRemote(action);
+    closeModals();
+    toast(id?"Ação atualizada para todos.":"Ação criada para todos.");
+  }catch(error){
+    firestoreError(error,"Não foi possível salvar a ação.");
+  }
 });
-function deleteAction(id){
+async function deleteAction(id){
   const a=actions.find(x=>Number(x.id)===Number(id));if(!a)return;
   if(!confirm(`Excluir a ação "${a.name}"?`))return;
-  actions=actions.filter(x=>Number(x.id)!==Number(id));persist();renderAll();toast("Ação excluída.");
+
+  try{
+    await deleteActionRemote(id);
+    toast("Ação excluída para todos.");
+  }catch(error){
+    firestoreError(error,"Não foi possível excluir a ação.");
+  }
 }
-document.getElementById("clearActionsBtn").addEventListener("click",()=>{
-  if(!actions.length){toast("Não há ações para apagar.");return}
+
+document.getElementById("clearActionsBtn").addEventListener("click",async ()=>{
+  if(!actions.length){
+    toast("Não há ações para apagar.");
+    return;
+  }
+
   if(!confirm("Excluir TODAS as ações?"))return;
-  actions=[];persist();renderAll();toast("Todas as ações foram excluídas.");
+
+  try{
+    const batch=db.batch();
+    actions.forEach(a=>batch.delete(db.collection("actions").doc(String(a.id))));
+    await batch.commit();
+    toast("Todas as ações foram excluídas.");
+  }catch(error){
+    firestoreError(error,"Não foi possível apagar todas as ações.");
+  }
 });
 
 /* ADMIN PARTICIPANTS */
@@ -1493,17 +1811,34 @@ function renderParticipantModal(){
 function openParticipants(id){
   currentParticipantActionId=Number(id);renderParticipantModal();openModal("participantsModal");
 }
-document.getElementById("adminAddParticipantBtn").addEventListener("click",()=>{
+document.getElementById("adminAddParticipantBtn").addEventListener("click",async ()=>{
   const a=actions.find(x=>Number(x.id)===Number(currentParticipantActionId));if(!a)return;
-  if(a.participants.length>=a.limit){alert("A ação já está lotada.");return}
   const id=Number(document.getElementById("adminParticipantSelect").value);if(!id)return;
-  if(!a.participants.includes(id))a.participants.push(id);
-  persist();renderParticipantModal();renderAll();toast("Participante adicionado.");
+
+  try{
+    await updateParticipantsTransaction(a.id,(current,data)=>{
+      const limit=Math.max(1,Number(data.limit)||1);
+      if(current.length>=limit)throw new Error("A ação já está lotada.");
+      return current.includes(id)?current:[...current,id];
+    });
+    toast("Participante adicionado.");
+  }catch(error){
+    if(error.message==="A ação já está lotada.")alert(error.message);
+    else firestoreError(error,"Não foi possível adicionar o participante.");
+  }
 });
-function removeParticipant(memberId){
+
+async function removeParticipant(memberId){
   const a=actions.find(x=>Number(x.id)===Number(currentParticipantActionId));if(!a)return;
-  a.participants=a.participants.filter(id=>Number(id)!==Number(memberId));
-  persist();renderParticipantModal();renderAll();toast("Participante removido.");
+
+  try{
+    await updateParticipantsTransaction(a.id,current=>
+      current.filter(id=>Number(id)!==Number(memberId))
+    );
+    toast("Participante removido.");
+  }catch(error){
+    firestoreError(error,"Não foi possível remover o participante.");
+  }
 }
 
 /* ACOLHEDOR JOIN */
@@ -1528,20 +1863,52 @@ function openJoin(id){
   sel.innerHTML=activeMembers().sort((a,b)=>a.name.localeCompare(b.name)).map(m=>`<option value="${m.id}">${esc(m.name)} — ${m.group}</option>`).join("");
   openModal("joinModal");
 }
-document.getElementById("confirmJoinBtn").addEventListener("click",()=>{
+document.getElementById("confirmJoinBtn").addEventListener("click",async ()=>{
   const a=actions.find(x=>Number(x.id)===Number(currentJoinActionId));if(!a)return;
   const id=Number(document.getElementById("joinMemberSelect").value);
-  if(a.status!=="Aberta"){alert("Essa ação não está mais aberta.");return}
-  if(a.participants.includes(id)){alert("Esse nome já está participando.");return}
-  if(a.participants.length>=a.limit){alert("A ação já está lotada.");return}
-  a.participants.push(id);persist();closeModals();renderAll();toast("Participação confirmada!");
+
+  try{
+    await updateParticipantsTransaction(a.id,(current,data)=>{
+      if(data.status!=="Aberta")throw new Error("Essa ação não está mais aberta.");
+      if(current.includes(id))throw new Error("Esse nome já está participando.");
+      const limit=Math.max(1,Number(data.limit)||1);
+      if(current.length>=limit)throw new Error("A ação já está lotada.");
+      return [...current,id];
+    });
+
+    closeModals();
+    toast("Participação confirmada para todos!");
+  }catch(error){
+    if([
+      "Essa ação não está mais aberta.",
+      "Esse nome já está participando.",
+      "A ação já está lotada."
+    ].includes(error.message)){
+      alert(error.message);
+    }else{
+      firestoreError(error,"Não foi possível confirmar a participação.");
+    }
+  }
 });
-document.getElementById("leaveActionBtn").addEventListener("click",()=>{
+
+document.getElementById("leaveActionBtn").addEventListener("click",async ()=>{
   const a=actions.find(x=>Number(x.id)===Number(currentJoinActionId));if(!a)return;
   const id=Number(document.getElementById("joinMemberSelect").value);
-  if(!a.participants.includes(id)){alert("Esse nome não está nessa ação.");return}
+
   if(!confirm("Cancelar a participação desse acolhedor?"))return;
-  a.participants=a.participants.filter(x=>Number(x)!==id);persist();closeModals();renderAll();toast("Participação cancelada.");
+
+  try{
+    await updateParticipantsTransaction(a.id,current=>{
+      if(!current.includes(id))throw new Error("Esse nome não está nessa ação.");
+      return current.filter(x=>Number(x)!==id);
+    });
+
+    closeModals();
+    toast("Participação cancelada para todos.");
+  }catch(error){
+    if(error.message==="Esse nome não está nessa ação.")alert(error.message);
+    else firestoreError(error,"Não foi possível cancelar a participação.");
+  }
 });
 
 /* MEMBERS */
@@ -1579,28 +1946,82 @@ function openEditMember(id){
   openModal("memberModal");
 }
 document.getElementById("newMemberBtn").addEventListener("click",openNewMember);
-document.getElementById("saveMemberBtn").addEventListener("click",()=>{
+document.getElementById("saveMemberBtn").addEventListener("click",async ()=>{
   const id=document.getElementById("memberId").value;
   const name=document.getElementById("memberName").value.trim();
   const birthday=document.getElementById("memberBirthday").value;
   const group=document.getElementById("memberGroup").value;
-  if(!name){alert("Digite o nome.");return}
-  if(id){const m=memberById(id);if(m)Object.assign(m,{name,birthday,group});toast("Acolhedor atualizado.");}
-  else{members.push({id:Date.now(),name,birthday,group,active:true});toast("Acolhedor adicionado.");}
-  persist();closeModals();renderAll();
+
+  if(!name){
+    alert("Digite o nome.");
+    return;
+  }
+
+  const member=id
+    ? {...memberById(id),name,birthday,group}
+    : {id:Date.now(),name,birthday,group,active:true};
+
+  try{
+    await saveMemberRemote(member);
+    closeModals();
+    toast(id?"Acolhedor atualizado para todos.":"Acolhedor adicionado para todos.");
+  }catch(error){
+    firestoreError(error,"Não foi possível salvar o acolhedor.");
+  }
 });
-function removeMember(id){
+
+async function removeMember(id){
   const m=memberById(id);if(!m)return;
   if(!confirm(`Remover ${m.name} da equipe? O histórico de ações será preservado.`))return;
-  m.active=false;persist();renderAll();toast("Acolhedor removido da equipe.");
+
+  try{
+    await saveMemberRemote({...m,active:false});
+    toast("Acolhedor removido da equipe.");
+  }catch(error){
+    firestoreError(error,"Não foi possível remover o acolhedor.");
+  }
 }
-function reactivateMember(id){const m=memberById(id);if(!m)return;m.active=true;persist();renderAll();toast("Acolhedor reativado.");}
-function deleteMemberForever(id){
+
+async function reactivateMember(id){
+  const m=memberById(id);if(!m)return;
+
+  try{
+    await saveMemberRemote({...m,active:true});
+    toast("Acolhedor reativado.");
+  }catch(error){
+    firestoreError(error,"Não foi possível reativar o acolhedor.");
+  }
+}
+
+async function deleteMemberForever(id){
   const m=memberById(id);if(!m)return;
   if(!confirm(`Excluir ${m.name} definitivamente? O nome também será removido das ações antigas.`))return;
-  members=members.filter(x=>Number(x.id)!==Number(id));
-  actions.forEach(a=>{a.participants=a.participants.filter(x=>Number(x)!==Number(id));if(Number(a.responsibleId)===Number(id))a.responsibleId=null});
-  persist();renderAll();toast("Registro excluído definitivamente.");
+
+  try{
+    const batch=db.batch();
+
+    batch.delete(db.collection("members").doc(String(id)));
+
+    actions.forEach(action=>{
+      const nextParticipants=action.participants.filter(x=>Number(x)!==Number(id));
+      const nextResponsible=Number(action.responsibleId)===Number(id)?null:action.responsibleId;
+
+      if(
+        nextParticipants.length!==action.participants.length ||
+        nextResponsible!==action.responsibleId
+      ){
+        batch.update(db.collection("actions").doc(String(action.id)),{
+          participants:nextParticipants,
+          responsibleId:nextResponsible
+        });
+      }
+    });
+
+    await batch.commit();
+    toast("Registro excluído definitivamente.");
+  }catch(error){
+    firestoreError(error,"Não foi possível excluir o registro.");
+  }
 }
 
 /* BIRTHDAYS */
@@ -1620,15 +2041,36 @@ function renderNotices(){
 document.getElementById("newNoticeBtn").addEventListener("click",()=>{
   document.getElementById("noticeTitle").value="";document.getElementById("noticeText").value="";openModal("noticeModal");
 });
-document.getElementById("saveNoticeBtn").addEventListener("click",()=>{
-  const title=document.getElementById("noticeTitle").value.trim(),text=document.getElementById("noticeText").value.trim();
-  if(!title||!text){alert("Preencha título e mensagem.");return}
-  notices.push({id:Date.now(),title,text,date:localIso()});persist();closeModals();renderAll();toast("Aviso publicado.");
+document.getElementById("saveNoticeBtn").addEventListener("click",async ()=>{
+  const title=document.getElementById("noticeTitle").value.trim();
+  const text=document.getElementById("noticeText").value.trim();
+
+  if(!title||!text){
+    alert("Preencha título e mensagem.");
+    return;
+  }
+
+  const notice={id:Date.now(),title,text,date:localIso()};
+
+  try{
+    await saveNoticeRemote(notice);
+    closeModals();
+    toast("Aviso publicado para todos.");
+  }catch(error){
+    firestoreError(error,"Não foi possível publicar o aviso.");
+  }
 });
-function deleteNotice(id){
+
+async function deleteNotice(id){
   const n=notices.find(x=>Number(x.id)===Number(id));if(!n)return;
   if(!confirm(`Excluir o aviso "${n.title}"?`))return;
-  notices=notices.filter(x=>Number(x.id)!==Number(id));persist();renderAll();toast("Aviso excluído.");
+
+  try{
+    await deleteNoticeRemote(id);
+    toast("Aviso excluído.");
+  }catch(error){
+    firestoreError(error,"Não foi possível excluir o aviso.");
+  }
 }
 
 /* MODALS */
